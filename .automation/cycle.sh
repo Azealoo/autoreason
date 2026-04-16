@@ -18,8 +18,8 @@ acquire_lock
 cd "$REPO_ROOT"
 
 # 1. Issues: classify new ones, work on the one most recently marked ready.
-log "step 1: listing open issues"
-ISSUES_JSON="$(gh issue list --state open --limit 50 --json number,updatedAt,labels)"
+log "step 1: listing open issues assigned to @me"
+ISSUES_JSON="$(gh issue list --state open --assignee @me --limit 50 --json number,updatedAt,labels)"
 echo "$ISSUES_JSON" | jq -c '.[]' | while read -r row; do
   NUM="$(echo "$row" | jq -r '.number')"
   UPDATED="$(echo "$row" | jq -r '.updatedAt')"
