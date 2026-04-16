@@ -5,6 +5,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 PR="${1:?pr number required}"
+is_numeric "$PR" || die "pr-comments: pr id must be numeric, got: $PR"
 STATE_FILE="$(state_file_for_pr "$PR")"
 
 cd "$REPO_ROOT"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared helpers for the autoreason automation.
+# Shared helpers for the workflow automation.
 set -euo pipefail
 
 AUTO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,7 +48,7 @@ read_state() {
 write_state_kv() {
   local file="$1" key="$2" value="$3"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp "${file}.XXXXXX")"
   if [[ -f "$file" ]]; then
     grep -v "^${key}=" "$file" > "$tmp" || true
   fi
@@ -65,30 +65,36 @@ get_state_kv() {
 has_skip_label() {
   local labels_json="$1"
   shift
-  local skip_list=("$@")
-  for skip in "${skip_list[@]}"; do
-    if echo "$labels_json" | grep -q "\"$skip\""; then
+  for skip in "$@"; do
+    if echo "$labels_json" | jq -e --arg s "$skip" 'any(.[]; .name == $s)' >/dev/null 2>&1; then
       return 0
     fi
   done
   return 1
 }
 
+is_numeric() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
 branch_for_issue() { echo "${AUTO_BRANCH_PREFIX}$1"; }
 
 # Download image attachments referenced in an issue/PR body.
-# Echoes one local path per line. Caps each file at 10 MB.
+# Echoes one local path per line. Restricted to trusted GitHub hosts,
+# capped at 5 files and 10 MB each.
 download_attachments() {
   local body="$1" issue="$2"
   local dest="$STATE_DIR/attachments/issue-$issue"
   mkdir -p "$dest"
   rm -f "$dest"/* 2>/dev/null || true
 
+  local host_filter='^https://(github\.com|user-images\.githubusercontent\.com|github-production-user-asset-[^/]+\.s3\.amazonaws\.com)/'
+
   local urls
   urls="$(printf '%s\n' "$body" \
     | grep -oE 'https?://[A-Za-z0-9._/~%?=&#+:@-]+' \
     | grep -iE '\.(png|jpe?g|gif|webp)(\?|$)|user-attachments/assets|user-images\.githubusercontent' \
-    | sort -u || true)"
+    | grep -E "$host_filter" \
+    | sort -u \
+    | head -5 || true)"
 
   [[ -z "$urls" ]] && return 0
 
@@ -100,7 +106,7 @@ download_attachments() {
     ext="$(echo "$url" | grep -oiE '\.(png|jpe?g|gif|webp)(\?|$)' | head -1 | tr -d '.?' | tr '[:upper:]' '[:lower:]')"
     [[ -z "$ext" ]] && ext="png"
     local path="$dest/attachment-$i.$ext"
-    if wget -q --timeout=20 --tries=2 --max-redirect=5 -O "$path" "$url" 2>/dev/null; then
+    if wget -q --timeout=20 --tries=2 --max-redirect=3 -O "$path" "$url" 2>/dev/null; then
       local size
       size=$(stat -c%s "$path" 2>/dev/null || echo 0)
       if [[ "$size" -gt 0 && "$size" -lt 10485760 ]]; then

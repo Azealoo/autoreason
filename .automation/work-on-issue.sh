@@ -5,8 +5,10 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ISSUE="${1:?issue number required}"
+is_numeric "$ISSUE" || die "work: issue id must be numeric, got: $ISSUE"
 STATE_FILE="$(state_file_for_issue "$ISSUE")"
 BRANCH="$(branch_for_issue "$ISSUE")"
+MAX_ATTEMPTS=3
 
 cd "$REPO_ROOT"
 
@@ -56,12 +58,29 @@ if [[ -n "$ATTACHMENTS" ]]; then
   while IFS= read -r p; do PROMPT+="- $p"$'\n'; done <<< "$ATTACHMENTS"
 fi
 
+bump_attempts_then_bail() {
+  local reason="$1"
+  local attempts
+  attempts="$(get_state_kv "$STATE_FILE" attempts)"
+  attempts=$(( ${attempts:-0} + 1 ))
+  write_state_kv "$STATE_FILE" attempts "$attempts"
+  git checkout main --quiet
+  git branch -D "$BRANCH" --quiet 2>/dev/null || true
+  if [[ "$attempts" -ge "$MAX_ATTEMPTS" ]]; then
+    log "work: $reason on #$ISSUE (attempt $attempts/$MAX_ATTEMPTS) — marking failed"
+    write_state_kv "$STATE_FILE" status "failed"
+  else
+    log "work: $reason on #$ISSUE (attempt $attempts/$MAX_ATTEMPTS) — will retry"
+  fi
+  exit 1
+}
+
 log "work: invoking Claude for #$ISSUE"
 set +e
 RESPONSE="$(claude -p "$PROMPT" \
   --permission-mode bypassPermissions \
   --allowedTools "Read,Write,Edit,Glob,Grep,Bash" \
-  --disallowedTools "WebFetch,WebSearch" \
+  --disallowedTools "WebFetch WebSearch Bash(git push:*) Bash(git remote:*) Bash(git config:*) Bash(gh:*) Bash(curl:*) Bash(wget:*) Bash(ssh:*) Bash(scp:*) Bash(rsync:*) Bash(nc:*)" \
   --output-format text \
   --max-budget-usd 3.00 \
   --no-session-persistence 2>&1)"
@@ -79,17 +98,15 @@ if echo "$RESPONSE" | grep -q '^BLOCKED:'; then
 fi
 
 if [[ "$CLAUDE_EXIT" -ne 0 ]]; then
-  log "work: claude exited $CLAUDE_EXIT; abandoning branch"
-  git checkout main --quiet
-  git branch -D "$BRANCH" --quiet 2>/dev/null || true
-  exit 1
+  bump_attempts_then_bail "claude exited $CLAUDE_EXIT"
 fi
 
 AFTER_SHA="$(git rev-parse HEAD)"
 if [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then
-  log "work: no commits made for #$ISSUE; abandoning branch"
+  log "work: no commits made for #$ISSUE — marking no_change"
   git checkout main --quiet
   git branch -D "$BRANCH" --quiet
+  write_state_kv "$STATE_FILE" status "no_change"
   exit 1
 fi
 
@@ -99,13 +116,18 @@ git push -u origin "$BRANCH" --quiet
 log "work: opening draft PR for #$ISSUE"
 PR_BODY="Closes #$ISSUE
 
-Implemented by autoreason. Review the diff and mark ready-for-review if it looks correct."
-PR_URL="$(gh pr create --draft --base main --head "$BRANCH" \
-  --title "$TITLE" --body "$PR_BODY")"
-PR_NUMBER="$(echo "$PR_URL" | grep -oE '[0-9]+$' || true)"
+Implemented by workflow automation. Review the diff and mark ready-for-review if it looks correct."
+gh pr create --draft --base main --head "$BRANCH" \
+  --title "$TITLE" --body "$PR_BODY" >/dev/null
+PR_NUMBER="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+if [[ -z "$PR_NUMBER" ]]; then
+  log "work: could not determine PR number for $BRANCH"
+  exit 1
+fi
 
-log "work: opened PR $PR_URL"
+log "work: opened PR #$PR_NUMBER"
 write_state_kv "$STATE_FILE" status "pr_opened"
 write_state_kv "$STATE_FILE" pr "$PR_NUMBER"
+write_state_kv "$STATE_FILE" attempts "0"
 
 git checkout main --quiet

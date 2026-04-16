@@ -6,6 +6,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ISSUE="${1:?issue number required}"
+is_numeric "$ISSUE" || die "classify: issue id must be numeric, got: $ISSUE"
 STATE_FILE="$(state_file_for_issue "$ISSUE")"
 
 log "classify: fetching issue #$ISSUE"
@@ -60,8 +61,13 @@ RESPONSE="$(claude -p "$PROMPT" \
   exit 2
 }
 
-# Extract the JSON object from the response (tolerate whitespace/markdown).
-JSON="$(echo "$RESPONSE" | sed -n 's/.*\({.*}\).*/\1/p' | head -1)"
+# Extract the JSON object from the response. Try strict parse first, then
+# strip common wrappers (```json fences, leading prose) and retry.
+CLEAN="$(printf '%s' "$RESPONSE" | sed -E 's/^```[a-zA-Z]*$//; s/^```$//')"
+JSON="$(printf '%s' "$CLEAN" | jq -c . 2>/dev/null || true)"
+if [[ -z "$JSON" ]]; then
+  JSON="$(printf '%s' "$CLEAN" | awk '/^\s*\{/,/^\s*\}\s*$/' | jq -c . 2>/dev/null || true)"
+fi
 if [[ -z "$JSON" ]]; then
   log "classify: could not parse response: $RESPONSE"
   exit 2
@@ -73,6 +79,7 @@ case "$DECISION" in
     log "classify: #$ISSUE READY"
     write_state_kv "$STATE_FILE" status "ready"
     write_state_kv "$STATE_FILE" last_issue_updated "$UPDATED"
+    write_state_kv "$STATE_FILE" attempts "0"
     exit 0
     ;;
   NEEDS_INFO)
