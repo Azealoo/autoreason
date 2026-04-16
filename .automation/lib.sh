@@ -59,7 +59,8 @@ write_state_kv() {
 get_state_kv() {
   local file="$1" key="$2"
   [[ -f "$file" ]] || return 0
-  grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+  # Guard each pipeline stage under `set -eo pipefail` in callers.
+  { grep "^${key}=" "$file" 2>/dev/null || true; } | { tail -1 || true; } | { cut -d= -f2- || true; }
 }
 
 has_skip_label() {
@@ -86,13 +87,17 @@ download_attachments() {
   mkdir -p "$dest"
   rm -f "$dest"/* 2>/dev/null || true
 
-  local host_filter='^https://(github\.com|user-images\.githubusercontent\.com|github-production-user-asset-[^/]+\.s3\.amazonaws\.com)/'
+  # Reject any URL that carries userinfo (user:pass@host) or whitespace.
+  # Host must be an exact GitHub-controlled domain; we anchor with a trailing
+  # '/' or ':' in the regex so we don't match evil-github.com.
+  local host_re='^https://(github\.com|user-images\.githubusercontent\.com|github-production-user-asset-[A-Za-z0-9-]+\.s3\.amazonaws\.com)(/|$)'
 
   local urls
   urls="$(printf '%s\n' "$body" \
-    | grep -oE 'https?://[A-Za-z0-9._/~%?=&#+:@-]+' \
-    | grep -iE '\.(png|jpe?g|gif|webp)(\?|$)|user-attachments/assets|user-images\.githubusercontent' \
-    | grep -E "$host_filter" \
+    | grep -oE 'https://[A-Za-z0-9._/~%?=&#+:-]+' \
+    | grep -v '@' \
+    | grep -iE '\.(png|jpe?g|gif|webp)(\?|$)|/user-attachments/assets/|user-images\.githubusercontent' \
+    | grep -E "$host_re" \
     | sort -u \
     | head -5 || true)"
 
@@ -106,7 +111,9 @@ download_attachments() {
     ext="$(echo "$url" | grep -oiE '\.(png|jpe?g|gif|webp)(\?|$)' | head -1 | tr -d '.?' | tr '[:upper:]' '[:lower:]')"
     [[ -z "$ext" ]] && ext="png"
     local path="$dest/attachment-$i.$ext"
-    if wget -q --timeout=20 --tries=2 --max-redirect=3 -O "$path" "$url" 2>/dev/null; then
+    # Allow one redirect because github.com/.../assets/... 302s to s3, but no
+    # more — keeps the final URL inside the trusted host set.
+    if wget -q --timeout=20 --tries=2 --max-redirect=1 -O "$path" "$url" 2>/dev/null; then
       local size
       size=$(stat -c%s "$path" 2>/dev/null || echo 0)
       if [[ "$size" -gt 0 && "$size" -lt 10485760 ]]; then

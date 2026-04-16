@@ -12,6 +12,18 @@ MAX_ATTEMPTS=3
 
 cd "$REPO_ROOT"
 
+# Recovery: if a prior cycle crashed with us stuck on an auto/ branch with
+# stray files, reset back to main cleanly. We only touch this when the current
+# branch is one we own.
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+if [[ "$CURRENT_BRANCH" == "${AUTO_BRANCH_PREFIX}"* ]]; then
+  log "work: recovering — found stuck on auto branch $CURRENT_BRANCH; resetting"
+  git reset --hard --quiet || true
+  git clean -fd --quiet || true
+  git checkout main --quiet || true
+  git branch -D "$CURRENT_BRANCH" --quiet 2>/dev/null || true
+fi
+
 # Refuse if repo has uncommitted changes — we won't pollute user's WIP.
 if ! git diff --quiet || ! git diff --cached --quiet; then
   log "work: repo has uncommitted changes, skipping #$ISSUE"
@@ -87,9 +99,12 @@ RESPONSE="$(claude -p "$PROMPT" \
 CLAUDE_EXIT=$?
 set -e
 
-echo "$RESPONSE" | tail -20
+printf '%s\n' "$RESPONSE" | tail -20
 
-if echo "$RESPONSE" | grep -q '^BLOCKED:'; then
+# Match BLOCKED only on the final non-empty line so we don't false-positive on
+# a literal "BLOCKED:" inside a code block Claude produced.
+LAST_LINE="$(printf '%s\n' "$RESPONSE" | awk 'NF {last=$0} END {print last}')"
+if [[ "$LAST_LINE" == BLOCKED:* ]]; then
   log "work: Claude reported BLOCKED on #$ISSUE; abandoning branch"
   git checkout main --quiet
   git branch -D "$BRANCH" --quiet
@@ -111,17 +126,31 @@ if [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then
 fi
 
 log "work: pushing $BRANCH"
-git push -u origin "$BRANCH" --quiet
+if ! git push -u origin "$BRANCH" --quiet; then
+  log "work: push failed for $BRANCH; cleaning up so next cycle can retry"
+  git checkout main --quiet || true
+  git branch -D "$BRANCH" --quiet 2>/dev/null || true
+  bump_attempts_then_bail "git push failed"
+fi
 
 log "work: opening draft PR for #$ISSUE"
 PR_BODY="Closes #$ISSUE
 
 Implemented by workflow automation. Review the diff and mark ready-for-review if it looks correct."
-gh pr create --draft --base main --head "$BRANCH" \
-  --title "$TITLE" --body "$PR_BODY" >/dev/null
+if ! gh pr create --draft --base main --head "$BRANCH" \
+      --title "$TITLE" --body "$PR_BODY" >/dev/null; then
+  # Push succeeded but PR creation failed (network/rate limit). Leave the
+  # remote branch and mark pr_pending so next cycle retries just the PR step.
+  log "work: gh pr create failed for $BRANCH; will retry PR creation next cycle"
+  write_state_kv "$STATE_FILE" status "pr_pending"
+  write_state_kv "$STATE_FILE" pr_branch "$BRANCH"
+  git checkout main --quiet
+  exit 1
+fi
 PR_NUMBER="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
 if [[ -z "$PR_NUMBER" ]]; then
   log "work: could not determine PR number for $BRANCH"
+  git checkout main --quiet
   exit 1
 fi
 

@@ -35,36 +35,52 @@ if [[ "$BRANCH" != ${AUTO_BRANCH_PREFIX}* ]]; then
   exit 0
 fi
 
-# Pull review + issue comments, filter by those newer than last_seen.
-LAST_SEEN="$(get_state_kv "$STATE_FILE" last_seen_comment_id)"
-LAST_SEEN="${LAST_SEEN:-0}"
+# Pull review + issue comments. Track two cursors (comments vs reviews) so the
+# id namespaces don't collide. Comments from non-trusted authors are IGNORED
+# entirely (never drive Claude) but still advance the cursor so we don't
+# re-scan them next cycle.
+LAST_C="$(get_state_kv "$STATE_FILE" last_seen_comment_id)"; LAST_C="${LAST_C:-0}"
+LAST_R="$(get_state_kv "$STATE_FILE" last_seen_review_id)";  LAST_R="${LAST_R:-0}"
 
-COMMENTS_JSON="$(gh pr view "$PR" --json comments,reviews | \
-  jq --argjson since "$LAST_SEEN" '
-    [ (.comments // [])[]   | select(.id > $since) | {id, author: .author.login, body} ] +
-    [ (.reviews  // [])[]   | select(.id > $since) | {id, author: .author.login, body: (.body // "(review submitted, no body)")} ]
-    | sort_by(.id)
-  ')"
+RAW_JSON="$(gh pr view "$PR" --json comments,reviews)"
+
+COMMENTS_JSON="$(echo "$RAW_JSON" | jq --argjson sc "$LAST_C" --argjson sr "$LAST_R" '
+  [ (.comments // [])[] | select(.id > $sc) | {kind:"c", id, author:.author.login, assoc:(.authorAssociation // "NONE"), body} ] +
+  [ (.reviews  // [])[] | select(.id > $sr) | {kind:"r", id, author:.author.login, assoc:(.authorAssociation // "NONE"), body:(.body // "(review submitted, no body)")} ]
+  | sort_by(.id)
+')"
+
+# Advance cursors for EVERYTHING we saw, trusted or not.
+NEW_MAX_C="$(echo "$RAW_JSON" | jq '[.comments[]?.id] | max // 0')"
+NEW_MAX_R="$(echo "$RAW_JSON" | jq '[.reviews[]?.id]  | max // 0')"
 
 COUNT="$(echo "$COMMENTS_JSON" | jq 'length')"
 if [[ "$COUNT" -eq 0 ]]; then
   log "pr-comments: no new comments on PR #$PR"
+  [[ "$NEW_MAX_C" -gt "$LAST_C" ]] && write_state_kv "$STATE_FILE" last_seen_comment_id "$NEW_MAX_C"
+  [[ "$NEW_MAX_R" -gt "$LAST_R" ]] && write_state_kv "$STATE_FILE" last_seen_review_id  "$NEW_MAX_R"
   exit 0
 fi
 
-# Don't loop on our own comments (repo user).
+# Only repo-trusted authors can drive Claude. On a public repo any random user
+# can comment — we refuse to pipe their text into a bypassPermissions session.
 SELF="$(gh api user --jq '.login')"
-FILTERED="$(echo "$COMMENTS_JSON" | jq --arg self "$SELF" '[.[] | select(.author != $self and (.body | length) > 0)]')"
+FILTERED="$(echo "$COMMENTS_JSON" | jq --arg self "$SELF" '
+  [ .[]
+    | select(.author != $self)
+    | select(.assoc == "OWNER" or .assoc == "COLLABORATOR" or .assoc == "MEMBER")
+    | select((.body // "") | length > 0)
+  ]')"
 FCOUNT="$(echo "$FILTERED" | jq 'length')"
-MAX_ID="$(echo "$COMMENTS_JSON" | jq 'map(.id) | max')"
 
 if [[ "$FCOUNT" -eq 0 ]]; then
-  log "pr-comments: no actionable comments on PR #$PR"
-  write_state_kv "$STATE_FILE" last_seen_comment_id "$MAX_ID"
+  log "pr-comments: no actionable trusted comments on PR #$PR (saw $COUNT untrusted/ignored)"
+  [[ "$NEW_MAX_C" -gt "$LAST_C" ]] && write_state_kv "$STATE_FILE" last_seen_comment_id "$NEW_MAX_C"
+  [[ "$NEW_MAX_R" -gt "$LAST_R" ]] && write_state_kv "$STATE_FILE" last_seen_review_id  "$NEW_MAX_R"
   exit 0
 fi
 
-COMMENTS_TEXT="$(echo "$FILTERED" | jq -r '.[] | "@\(.author): \(.body)\n"')"
+COMMENTS_TEXT="$(echo "$FILTERED" | jq -r '.[] | "@\(.author) [\(.assoc)]: \(.body)\n"')"
 
 log "pr-comments: checking out $BRANCH"
 git fetch origin --quiet
@@ -82,16 +98,19 @@ set +e
 RESPONSE="$(claude -p "$PROMPT" \
   --permission-mode bypassPermissions \
   --allowedTools "Read,Write,Edit,Glob,Grep,Bash" \
-  --disallowedTools "WebFetch,WebSearch" \
+  --disallowedTools "WebFetch,WebSearch,Bash(git push:*),Bash(git remote:*),Bash(git config:*),Bash(gh:*),Bash(curl:*),Bash(wget:*),Bash(ssh:*),Bash(scp:*),Bash(rsync:*),Bash(nc:*)" \
   --output-format text \
   --max-budget-usd 3.00 \
   --no-session-persistence 2>&1)"
 CLAUDE_EXIT=$?
 set -e
 
-echo "$RESPONSE" | tail -20
+printf '%s\n' "$RESPONSE" | tail -20
 
-if echo "$RESPONSE" | grep -q '^BLOCKED:'; then
+# Only treat as BLOCKED if Claude emitted it as its final non-empty line —
+# avoids matching "BLOCKED:" appearing inside a code block or quoted comment.
+LAST_LINE="$(printf '%s\n' "$RESPONSE" | awk 'NF {last=$0} END {print last}')"
+if [[ "$LAST_LINE" == BLOCKED:* ]]; then
   log "pr-comments: BLOCKED on PR #$PR; leaving state unchanged"
   git checkout main --quiet
   exit 1
@@ -111,5 +130,6 @@ else
   log "pr-comments: no changes were made"
 fi
 
-write_state_kv "$STATE_FILE" last_seen_comment_id "$MAX_ID"
+[[ "$NEW_MAX_C" -gt "$LAST_C" ]] && write_state_kv "$STATE_FILE" last_seen_comment_id "$NEW_MAX_C"
+[[ "$NEW_MAX_R" -gt "$LAST_R" ]] && write_state_kv "$STATE_FILE" last_seen_review_id  "$NEW_MAX_R"
 git checkout main --quiet

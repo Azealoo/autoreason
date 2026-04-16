@@ -19,9 +19,13 @@ acquire_lock
 
 cd "$REPO_ROOT"
 
-# 1. Issues: classify new ones, work on the one most recently marked ready.
+# 1. Issues: classify new ones. Cap classifications per cycle to bound cost —
+# 50 new issues * $0.50 budget each would be $25 per tick otherwise.
+MAX_CLASSIFY_PER_CYCLE="${MAX_CLASSIFY_PER_CYCLE:-10}"
+CLASSIFIED=0
+
 log "step 1: listing open issues assigned to @me"
-ISSUES_JSON="$(gh issue list --state open --assignee @me --limit 50 --json number,updatedAt,labels)"
+ISSUES_JSON="$(gh issue list --state open --assignee @me --limit 200 --json number,updatedAt,labels)"
 while read -r row; do
   NUM="$(echo "$row" | jq -r '.number')"
   UPDATED="$(echo "$row" | jq -r '.updatedAt')"
@@ -29,40 +33,45 @@ while read -r row; do
   CURRENT="$(get_state_kv "$STATE_FILE" status)"
   LAST_UPDATED="$(get_state_kv "$STATE_FILE" last_issue_updated)"
 
+  do_classify=0
   case "$CURRENT" in
-    ready|pr_opened)
+    ready|pr_opened|pr_pending)
       # handled by later steps
       ;;
     blocked|skipped|closed|failed|no_change)
-      # terminal unless the issue body was edited
-      if [[ "$UPDATED" != "$LAST_UPDATED" ]]; then
-        log "issue #$NUM was edited since '$CURRENT'; re-classifying"
-        "$AUTO_ROOT/classify-issue.sh" "$NUM" || true
-      fi
+      [[ "$UPDATED" != "$LAST_UPDATED" ]] && do_classify=1
       ;;
     needs_info)
-      if [[ "$UPDATED" != "$LAST_UPDATED" ]]; then
-        log "issue #$NUM updated after needs_info; re-classifying"
-        "$AUTO_ROOT/classify-issue.sh" "$NUM" || true
-      fi
+      [[ "$UPDATED" != "$LAST_UPDATED" ]] && do_classify=1
       ;;
     *)
-      log "issue #$NUM: new, classifying"
-      "$AUTO_ROOT/classify-issue.sh" "$NUM" || true
+      do_classify=1
       ;;
   esac
+
+  if [[ "$do_classify" -eq 1 ]]; then
+    if [[ "$CLASSIFIED" -ge "$MAX_CLASSIFY_PER_CYCLE" ]]; then
+      log "issue #$NUM: classify cap ($MAX_CLASSIFY_PER_CYCLE) reached, deferring"
+      continue
+    fi
+    log "issue #$NUM: classifying (state=${CURRENT:-new})"
+    "$AUTO_ROOT/classify-issue.sh" "$NUM" || true
+    CLASSIFIED=$((CLASSIFIED+1))
+  fi
 done < <(echo "$ISSUES_JSON" | jq -c '.[]')
 
-# 2. Pick one 'ready' issue to implement this cycle.
+# 2. Pick the most-recently-marked-ready issue (by state-file mtime) so
+# newly-ready issues don't starve behind older ones.
 READY_ISSUE=""
-for f in "$STATE_DIR"/issue-*.state; do
+READY_FILE=""
+while IFS= read -r f; do
   [[ -f "$f" ]] || continue
-  STATUS="$(get_state_kv "$f" status)"
-  if [[ "$STATUS" == "ready" ]]; then
-    READY_ISSUE="$(basename "$f" .state | sed 's/^issue-//')"
-    break
+  if [[ "$(get_state_kv "$f" status)" == "ready" ]]; then
+    READY_FILE="$f"; break
   fi
-done
+done < <(find "$STATE_DIR" -maxdepth 1 -name 'issue-*.state' -printf '%T@ %p\n' \
+         | sort -rn | awk '{ $1=""; sub(/^ /,""); print }')
+[[ -n "$READY_FILE" ]] && READY_ISSUE="$(basename "$READY_FILE" .state | sed 's/^issue-//')"
 
 if [[ -n "$READY_ISSUE" ]]; then
   log "step 2: working on issue #$READY_ISSUE"
